@@ -23,6 +23,7 @@ import getopt
 import os
 import sys
 from collections import namedtuple
+from typing import Union
 
 import pkg_resources
 import yaml
@@ -32,7 +33,7 @@ ConfigOpt = namedtuple('ConfigOpt', ['short', 'long', 'desc', 'has_value', 'req'
 
 class ArgCtrl:
 
-    def __init__(self, name: str, dflt_config: str = 'config.yaml'):
+    def __init__(self, name: str, dflt_config: Union[str, None] = 'config.yaml'):
         self._opts = {}
         self.add_option('h', 'help', 'Display usage')
         if dflt_config is not None:
