@@ -132,3 +132,4 @@ dmypy.json
 # IDEA
 /.idea/
 /*.iml
+/results/

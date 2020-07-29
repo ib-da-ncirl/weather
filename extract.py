@@ -20,7 +20,6 @@
 #  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #  SOFTWARE.
 #
-import datetime
 import os
 import time
 from collections import namedtuple
@@ -40,6 +39,8 @@ from misc.arg_ctrl import ArgCtrl
 
 BASE_URL = 'https://cli.fusio.net/cli/climate_data/webdata/'
 INTER_REQ_DELAY = 20  # default inter-request delay to avoid swamping host
+DFLT_SAVE_FOLDER = './'
+DFLT_INFO_PATH = './info.csv'
 
 
 class Comparator(Enum):
@@ -502,7 +503,7 @@ def get_data_columns(base_uri, station_ids: list, station_names: list, args: dic
             these_args['names'] = [x for x in DFLT_READ_ARGS['names']]
             these_args['names'].extend(column_names)
             these_args['converters'] = {k: v for k, v in converters.items()}
-            these_args['nrows'] = int(args['nrows']) if args['nrows'] is not None else None
+            these_args['nrows'] = args['nrows'] if args['nrows'] is not None else None
 
             read_args[station_num] = {'args': these_args, 'filename': read_file}
 
@@ -538,14 +539,14 @@ def get_data(base_uri, station_ids: list, station_names: list, args: dict):
                           DATA_WDDIR,
                           DATA_WW, DATA_W, DATA_SUN, DATA_VIS, DATA_CLHT, DATA_CLAMT],
                 'converters': {DATA_VAPPR: handle_ws_float, DATA_RHUM: handle_ws_int, DATA_WDDIR: handle_ws_int},
-                'nrows': None if 'nrows' not in args else int(args['nrows'])
+                'nrows': None if 'nrows' not in args else args['nrows']
             }),
             ReadParam(f"dly{station_num}", {
                 'skiprows': 9,
                 'parse_dates': [DATA_DATE],
                 'header': 0,
                 'names': [DATA_DATE, DATA_IND_RAIN, DATA_RAIN],
-                'nrows': None if 'nrows' not in args else int(args['nrows'])
+                'nrows': None if 'nrows' not in args else args['nrows']
             })], args)
 
         if data_cache[station_num] is not None:
@@ -582,6 +583,42 @@ def get_station_data(base_uri, station_id: int, station_name: str, read_args: di
         print(f"Loaded {len(df)} rows")
 
     return df
+
+
+def analyse_station_data(base_uri, station_id: int, station_name: str, read_args: dict, args: dict, filters=None):
+    """
+    Analyse the data for the specified station
+    :param base_uri: Base uri
+    :param station_id: station ids
+    :param station_name: station name
+    :param read_args: pandas.read_csv() arguments
+    :param args: Arguments
+    :param filters: filter conditions
+    :return:
+    """
+
+    df, read_file = load_station_data(base_uri, [ReadParam(read_args['filename'], read_args['args'])], args,
+                                      filters=filters)
+
+    if df is not None:
+        mode = 'a' if os.path.isfile(args['info']) else 'w'
+        with open(args['info'], mode) as fout:
+            if mode == 'w':
+                fout.write("station_id,station_name,filename,"
+                           "min_date,max_date,"
+                           "col_na_count,col_null_count,col_empty_count\n")
+
+            na_str = ''
+            null_str = ''
+            empty_str = ''
+            for col in df.columns:
+                na_str = f"{na_str}{';' if len(na_str) else ''}{col}={df[col].isna().sum()}"
+                null_str = f"{null_str}{';' if len(null_str) else ''}{col}={df[col].isnull().sum()}"
+                empty_str = f"{empty_str}{';' if len(empty_str) else ''}{col}={len(df[df[col] == ''])}"
+
+            fout.write(f"{station_id},{station_name},{read_args['filename']},"
+                       f"{df[DATA_DATE].min()},{df[DATA_DATE].max()},"
+                       f"{na_str},{null_str},{empty_str}\n")
 
 
 def error(msg):
@@ -684,20 +721,24 @@ def save_to_hbase(data: pd.DataFrame, station: int, row_template: dict, args: di
 
 def main():
     arg_ctrl = ArgCtrl(os.path.basename(sys.argv[0]), dflt_config=None)
-    arg_ctrl.add_option('n', 'nrows', 'Number of rows of file to read', has_value=True)
+    arg_ctrl.add_option('n', 'nrows', 'Number of rows of file to read', has_value=True, type='int')
     arg_ctrl.add_option('t', 'thrift', f'Address of Thrift host; default {happybase.DEFAULT_HOST}', has_value=True,
                         dfl_value=happybase.DEFAULT_HOST)
     arg_ctrl.add_option('p', 'port', f'Host port; default {happybase.DEFAULT_PORT}', has_value=True,
                         dfl_value=happybase.DEFAULT_PORT)
     arg_ctrl.add_option('d', 'delay', f'Inter-request delay (sec); default {happybase.DEFAULT_PORT}', has_value=True,
-                        dfl_value=INTER_REQ_DELAY)
-    arg_ctrl.add_option('f', 'folder', f'Folder to save files to', has_value=True, dfl_value='./')
+                        dfl_value=INTER_REQ_DELAY, type='int')
+    arg_ctrl.add_option('f', 'folder', f'Folder to save files to; default {DFLT_SAVE_FOLDER}', has_value=True,
+                        dfl_value=DFLT_SAVE_FOLDER)
+    arg_ctrl.add_option('i', 'info', f'Path to save station data info to; default {DFLT_INFO_PATH}', has_value=True,
+                        dfl_value=DFLT_INFO_PATH)
+    arg_ctrl.add_option('b', 'begin', 'Minimum date for readings; dd-mm-yyyy', has_value=True, type="date=%d-%m-%Y")
+    arg_ctrl.add_option('e', 'end', 'Maximum date for readings; dd-mm-yyyy', has_value=True, type="date=%d-%m-%Y")
     arg_ctrl.add_option('s', 'save', f'Save files')
+    arg_ctrl.add_option('a', 'analyse', f'Analyse files')
     arg_ctrl.add_option('u', 'upload', f'Upload data to hbase')
 
     app_cfg = arg_ctrl.get_app_config(sys.argv[1:])
-    if 'delay' in app_cfg:
-        app_cfg['delay'] = int(app_cfg['delay'])
 
     uri = 'file://../data/'
     # uri = BASE_URL
@@ -708,32 +749,38 @@ def main():
     if 'save' in app_cfg:
         save_data(BASE_URL, stations[STATION_NUM].tolist(), stations[STATION_NAME].tolist(), app_cfg)
 
-    if 'upload' in app_cfg:
-
+    if 'analyse' in app_cfg or 'upload' in app_cfg:
         column_list, read_args = get_data_columns(uri, stations[STATION_NUM].tolist(), stations[STATION_NAME].tolist(),
                                                   app_cfg)
-        row_template = {get_row_key(x): "" for x in column_list}
 
-        connection = create_table_hbase(DATA_TABLE, app_cfg)
+        station_filters = []
+        if 'upload' in app_cfg:
+
+            row_template = {get_row_key(x): "" for x in column_list}
+
+            if app_cfg['begin'] is not None:
+                station_filters.append(DfFilter(DATA_DATE, 'subset_by_val', FilterArg(app_cfg['begin'], Comparator.GT_EQ)))
+            if app_cfg['end'] is not None:
+                station_filters.append(DfFilter(DATA_DATE, 'subset_by_val', FilterArg(app_cfg['end'], Comparator.LT_EQ)))
+
+            connection = create_table_hbase(DATA_TABLE, app_cfg)
 
         station_range = range(len(stations[STATION_NUM]))
         for index in station_range:
             station_num = stations[STATION_NUM].iloc[index]
             station_name = stations[STATION_NAME].iloc[index]
 
-            data = get_station_data(uri,    #BASE_URL,
-                                    station_num, station_name, read_args[station_num], app_cfg,
-                                    filters=[
-                                        DfFilter(DATA_DATE, 'subset_by_val', FilterArg(datetime.datetime(1990, 1, 1),
-                                                                                       Comparator.GT_EQ)),
-                                        DfFilter(DATA_DATE, 'subset_by_val', FilterArg(datetime.datetime(1990, 12, 31),
-                                                                                       Comparator.LT_EQ))
-                                    ])
+            if 'upload' in app_cfg:
+                data = get_station_data(uri, station_num, station_name, read_args[station_num], app_cfg,
+                                        filters=station_filters)
+            else:
+                analyse_station_data(uri, station_num, station_name, read_args[station_num], app_cfg)
 
             loop_end = index == station_range.stop - 1
             inter_request_delay(not loop_end, app_cfg['delay'])
 
-            save_to_hbase(data, station_num, row_template, app_cfg, connection=connection, close=loop_end)
+            if 'upload' in app_cfg:
+                save_to_hbase(data, station_num, row_template, app_cfg, connection=connection, close=loop_end)
 
 
 if __name__ == "__main__":
