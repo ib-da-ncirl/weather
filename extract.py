@@ -25,7 +25,7 @@ import time
 from collections import namedtuple
 from enum import Enum
 from http import HTTPStatus
-from typing import Union, AnyStr, Tuple, Any, List
+from typing import Union, AnyStr, Tuple, List
 from zipfile import ZipFile, ZipExtFile
 import pandas as pd
 import requests
@@ -38,7 +38,7 @@ from typing.io import IO
 from misc.arg_ctrl import ArgCtrl
 
 BASE_URL = 'https://cli.fusio.net/cli/climate_data/webdata/'
-INTER_REQ_DELAY = 20  # default inter-request delay to avoid swamping host
+INTER_REQ_DELAY = 10  # default inter-request delay to avoid swamping host
 DFLT_SAVE_FOLDER = './'
 DFLT_INFO_PATH = './info.csv'
 
@@ -116,14 +116,18 @@ def load_file(filepath_or_buffer: Union[str, ZipExtFile, IO[AnyStr]], count: int
     return lines
 
 
-def load_csv(filepath_or_buffer: Union[str, ZipExtFile, IO[AnyStr]], read_args: dict, filters=None) -> pd.DataFrame:
+def load_csv(filepath_or_buffer: Union[str, ZipExtFile, IO[AnyStr]], read_args: dict = None, filters=None,
+             drop=None) -> pd.DataFrame:
     """
     Load a csv file
     :param filepath_or_buffer: uri str or file-like object
     :param read_args: pandas.read_csv() arguments
     :param filters: filter conditions
+    :param drop: list of columns to drop
     :return:
     """
+    if read_args is None:
+        read_args = {}
     df = None
     if not isinstance(filepath_or_buffer, ZipExtFile):
         read_from, result = get_filepath_or_buffer(filepath_or_buffer)
@@ -135,6 +139,9 @@ def load_csv(filepath_or_buffer: Union[str, ZipExtFile, IO[AnyStr]], read_args: 
     if read_from is not None:
         df = df_filter(
             pd.read_csv(read_from, **read_args), filters=filters)
+
+    if drop is not None and len(drop):
+        df.drop(labels=drop, inplace=True)
 
     return df
 
@@ -241,6 +248,8 @@ def df_filter(df: pd.DataFrame, filters=None):
     """
     if filters is None:
         filters = []
+    if isinstance(filters, DfFilter):
+        filters = [filters]
 
     sub_df = df
     if sub_df is not None and len(filters):
@@ -258,7 +267,6 @@ def df_filter(df: pd.DataFrame, filters=None):
 
 def get_stations(base_uri, open_year: FilterArg = None, close_year: FilterArg = None, county: str = None,
                  number: Union[int, list] = None):
-
     print(f"Loading all stations data")
 
     df = load_csv(f"{base_uri}StationDetails.csv", {
@@ -271,14 +279,16 @@ def get_stations(base_uri, open_year: FilterArg = None, close_year: FilterArg = 
     index = df[df[STATION_NAME] == 'CASTLEMAGNER'].index[0]
     if df.loc[index, STATION_CLOSE] == 0:
         df.loc[index, STATION_CLOSE] = 2002
+    # - remove any commas in station name
+    df[STATION_NAME] = df[STATION_NAME].apply(lambda name: name.replace(",", ""))
 
     filters = []
     if county is not None:
         filters.append(DfFilter(STATION_COUNTY, 'subset_by_val', FilterArg(county, Comparator.EQ)))
     if open_year is not None:
-        filters.append(DfFilter(STATION_OPEN, 'subset_by_val', FilterArg(open_year, Comparator.EQ)))
+        filters.append(DfFilter(STATION_OPEN, 'subset_by_val', open_year))
     if close_year is not None:
-        filters.append(DfFilter(STATION_CLOSE, 'subset_by_val', FilterArg(close_year, Comparator.EQ)))
+        filters.append(DfFilter(STATION_CLOSE, 'subset_by_val', close_year))
     if number is not None:
         if isinstance(number, int):
             filters.append(DfFilter(STATION_NUM, 'subset_by_val', FilterArg(number, Comparator.EQ)))
@@ -304,21 +314,51 @@ def subset_by_val(df: pd.DataFrame, column: str, filter_value: FilterArg):
         target_value = df[column].min()
     else:
         target_value = filter_value.value
+    if isinstance(target_value, list):
+        def lt(val):
+            return val < min(target_value)
+
+        def lt_eq(val):
+            return val <= min(target_value)
+
+        def eq(val):
+            return val in target_value
+
+        def gt_eq(val):
+            return val >= max(target_value)
+
+        def gt(val):
+            return val > max(target_value)
+    else:
+        def lt(val):
+            return val < target_value
+
+        def lt_eq(val):
+            return val <= target_value
+
+        def eq(val):
+            return val == target_value
+
+        def gt_eq(val):
+            return val >= target_value
+
+        def gt(val):
+            return val > target_value
     if filter_value.comparitor == Comparator.LT:
         def value_filter(val):
-            return val < target_value
+            return lt(val)
     elif filter_value.comparitor == Comparator.LT_EQ:
         def value_filter(val):
-            return val <= target_value
+            return lt_eq(val)
     elif filter_value.comparitor == Comparator.EQ:
         def value_filter(val):
-            return val == target_value
+            return eq(val)
     elif filter_value.comparitor == Comparator.GT:
         def value_filter(val):
-            return val > target_value
+            return gt_eq(val)
     elif filter_value.comparitor == Comparator.GT_EQ:
         def value_filter(val):
-            return val >= target_value
+            return gt(val)
     else:
         def value_filter(val):
             return True
@@ -371,8 +411,8 @@ def save_station_data(base_uri: str, file_list: list, save_to: str, args: dict) 
     return ok, saved_to
 
 
-def load_station_data(base_uri: str, filename: Union[ReadParam, list], args: dict, lines=None, filters=None) -> \
-        Tuple[Union[pd.DataFrame, List], AnyStr]:
+def load_station_data(base_uri: str, filename: Union[ReadParam, list], args: dict, lines=None, filters=None,
+                      drop=None) -> Tuple[Union[pd.DataFrame, List], AnyStr]:
     """
     Retrieve the data for the specified station, as a DataFrame or list of strings
     :param base_uri: Base uri
@@ -380,12 +420,14 @@ def load_station_data(base_uri: str, filename: Union[ReadParam, list], args: dic
     :param args: Arguments
     :param lines: Number of lines to read; if specified a list of strings is returned
     :param filters: filter conditions
+    :param drop: list of columns to drop
     :return: DataFrame of 'lines' is not specified, otherwise list of strings
     """
     if isinstance(filename, ReadParam):
         file_list = [filename]
     else:
         file_list = filename
+    loops = len(file_list)
 
     df = None
     read_file = None
@@ -398,10 +440,15 @@ def load_station_data(base_uri: str, filename: Union[ReadParam, list], args: dic
                 with zipped.open(f"{entry.filename}.csv") as csv_file:
                     read_file = entry.filename
                     if lines is None:
-                        df = load_csv(csv_file, entry.read_args, filters=filters)
+                        df = load_csv(csv_file, entry.read_args, filters=filters, drop=drop)
                     else:
                         df = load_file(csv_file, lines)
                     break
+        else:
+            print(f"Not available {zip_url}")
+
+        loops -= 1
+        inter_request_delay(loops > 0, base_uri, args['delay'])
 
     return df, read_file
 
@@ -425,8 +472,8 @@ def save_data(base_uri, station_ids: list, station_names: list, args: dict):
         else:
             print(f"Not saved")
 
-        if sid < len(station_ids) - 1:
-            time.sleep(int(args['delay']))
+        loop = sid < len(station_ids) - 1
+        inter_request_delay(loop, base_uri, args['delay'])
 
 
 DFLT_READ_ARGS = {
@@ -440,7 +487,7 @@ DFLT_READ_ARGS = {
 
 
 def handle_ws_float(value):
-    return float(value) if len(value.strip()) > 0 else 0
+    return float(value) if len(value.strip()) > 0 else 0.0
 
 
 def handle_ws_int(value):
@@ -493,23 +540,25 @@ def get_data_columns(base_uri, station_ids: list, station_names: list, args: dic
                         column_names.append(this_column)
 
                         # add converters if required
-                        if col == DATA_VAPPR:
+                        if col in [DATA_RAIN, DATA_TEMP, DATA_WETB, DATA_DEWPT, DATA_VAPPR, DATA_MSL, DATA_SUN]:
                             converters[this_column] = handle_ws_float
-                        elif col in [DATA_RHUM, DATA_WDDIR]:
+                        elif col in [DATA_RHUM, DATA_WDDIR, DATA_VIS, DATA_WDSP, DATA_WW, DATA_W, DATA_CLHT,
+                                     DATA_CLAMT]:
                             converters[this_column] = handle_ws_int
                     break
+
             these_args = DFLT_READ_ARGS.copy()
             these_args['skiprows'] = skiprows
             these_args['names'] = [x for x in DFLT_READ_ARGS['names']]
             these_args['names'].extend(column_names)
             these_args['converters'] = {k: v for k, v in converters.items()}
-            these_args['nrows'] = args['nrows'] if args['nrows'] is not None else None
+            these_args['nrows'] = None if 'nrows' not in args else args['nrows']
 
             read_args[station_num] = {'args': these_args, 'filename': read_file}
 
             column_list.extend(column_names)
 
-        inter_request_delay(sid < len(station_ids) - 1, args['delay'])
+        inter_request_delay(sid < len(station_ids) - 1, base_uri, args['delay'])
 
     return column_list, read_args
 
@@ -552,17 +601,18 @@ def get_data(base_uri, station_ids: list, station_names: list, args: dict):
         if data_cache[station_num] is not None:
             print(f"Loaded {len(data_cache[station_num])} rows")
 
-        inter_request_delay(sid < len(station_ids) - 1, args['delay'])
+        inter_request_delay(sid < len(station_ids) - 1, base_uri, args['delay'])
 
     return data_cache
 
 
-def inter_request_delay(condition, delay):
-    if condition:
+def inter_request_delay(condition, uri, delay):
+    if condition and uri.startswith('http'):
         time.sleep(delay)
 
 
-def get_station_data(base_uri, station_id: int, station_name: str, read_args: dict, args: dict, filters=None):
+def get_station_data(base_uri, station_id: int, station_name: str, read_args: dict, args: dict, filters=None,
+                     drop=None):
     """
     Retrieve the data for the specified station
     :param base_uri: Base uri
@@ -571,13 +621,14 @@ def get_station_data(base_uri, station_id: int, station_name: str, read_args: di
     :param read_args: pandas.read_csv() arguments
     :param args: Arguments
     :param filters: filter conditions
+    :param drop: list of columns to drop
     :return:
     """
 
     print(f"Loading data for station {station_id}: {station_name}")
 
     df, read_file = load_station_data(base_uri, [ReadParam(read_args['filename'], read_args['args'])], args,
-                                      filters=filters)
+                                      filters=filters, drop=drop)
 
     if df is not None:
         print(f"Loaded {len(df)} rows")
@@ -585,7 +636,8 @@ def get_station_data(base_uri, station_id: int, station_name: str, read_args: di
     return df
 
 
-def analyse_station_data(base_uri, station_id: int, station_name: str, read_args: dict, args: dict, filters=None):
+def analyse_station_data(base_uri, station_id: int, station_name: str, read_args: dict, args: dict,
+                         query_rm_file: bool, filters=None):
     """
     Analyse the data for the specified station
     :param base_uri: Base uri
@@ -593,9 +645,17 @@ def analyse_station_data(base_uri, station_id: int, station_name: str, read_args
     :param station_name: station name
     :param read_args: pandas.read_csv() arguments
     :param args: Arguments
+    :param query_rm_file: Query file deletion if exists
     :param filters: filter conditions
     :return:
     """
+
+    if query_rm_file and os.path.exists(args['info']):
+        choice = ''
+        while not choice == 'y' and not choice == 'n':
+            choice = input(f"'{args['info']}' exists\nDelete it [y/n]: ").lower()
+        if choice == 'y':
+            os.remove(args['info'])
 
     df, read_file = load_station_data(base_uri, [ReadParam(read_args['filename'], read_args['args'])], args,
                                       filters=filters)
@@ -606,23 +666,98 @@ def analyse_station_data(base_uri, station_id: int, station_name: str, read_args
             if mode == 'w':
                 fout.write("station_id,station_name,filename,"
                            "min_date,max_date,"
+                           "columns,type,"
                            "col_na_count,col_null_count,col_empty_count\n")
 
             na_str = ''
             null_str = ''
             empty_str = ''
+            columns_str = DATA_DATE  # always present
             for col in df.columns:
                 na_str = f"{na_str}{';' if len(na_str) else ''}{col}={df[col].isna().sum()}"
                 null_str = f"{null_str}{';' if len(null_str) else ''}{col}={df[col].isnull().sum()}"
                 empty_str = f"{empty_str}{';' if len(empty_str) else ''}{col}={len(df[df[col] == ''])}"
+                # get column name ex station id
+                match = re.match(r"^(.*)_\d+$", col)
+                if match:
+                    columns_str = f"{columns_str}{';' if len(columns_str) else ''}{match.group(1)}"
+            # get file type
+            match = re.match(r"([A-Za-z]+)\d+", read_args['filename'])
+            typ = match.group(1) if match else ''
 
             fout.write(f"{station_id},{station_name},{read_args['filename']},"
                        f"{df[DATA_DATE].min()},{df[DATA_DATE].max()},"
+                       f"{columns_str},{typ},"
                        f"{na_str},{null_str},{empty_str}\n")
 
 
-def error(msg):
-    sys.exit(f"Error: {msg}")
+def station_analysis_summary(args: dict):
+    create = True
+    for typ in ['hly', 'dly']:
+        # read station analysis csv
+        filepath = args['info']
+        if not filepath.startswith('file://'):
+            filepath = f"file://{args['info']}"
+        df = load_csv(filepath, read_args={
+            'parse_dates': ['min_date', 'max_date'],
+        }, filters=DfFilter('type', 'subset_by_val', FilterArg(typ, Comparator.EQ)))
+
+        df.drop(['col_na_count', 'col_null_count', 'col_empty_count'], axis=1,
+                inplace=True)  # just cluttering up the view
+
+        # work out which columns appear for each station
+        column_set = set()
+
+        def update_column_set(cols_u):
+            nonlocal column_set
+            column_set = column_set.union(set(cols_u))
+
+        df['columns'].apply(lambda cols_l: update_column_set(cols_l.split(";")))
+
+        for col in column_set:
+            df[col] = False
+
+        cols_idx = list(df.columns).index('columns')
+        for row_idx in range(len(df)):
+            cols = df.iloc[row_idx, cols_idx].split(';')
+            for col in cols:
+                col_col_idx = list(df.columns).index(col)
+                df.iloc[row_idx, col_col_idx] = True
+
+        # save results
+        col_width = 0
+        for col in column_set:
+            col_width = max(col_width, len(col))
+
+        with open(args['station_summary'], "w" if create else "a") as fhout:
+            create = False
+
+            heading = f"Summary for {typ} data"
+            fhout.write(f"{heading}\n{'-' * len(heading)}\n\n")
+
+            fhout.write(f"Earliest readings start date: {df['min_date'].min()}\n")
+            fhout.write(f"Latest readings start date: {df['min_date'].max()}\n")
+            fhout.write(f"Earliest readings end date: {df['max_date'].min()}\n")
+            fhout.write(f"Latest readings end date: {df['max_date'].max()}\n")
+            fhout.write(f"Max readings coverage date range: {df['min_date'].max()} to {df['max_date'].min()}\n\n")
+
+            have_all = []
+            fhout.write(f"Station data availability:\n")
+            for col in column_set:
+                have_col_df = df[df[col]]
+                have_col_cnt = len(have_col_df)
+                if have_col_cnt == len(df):
+                    have_all.append(col)
+                    matches = ''
+                else:
+                    matches = f", {have_col_df['station_id'].tolist()}"
+                fhout.write(f"{col:{col_width}s}: {have_col_cnt:2d} of {len(df):2d}{matches}\n")
+
+            fhout.write(f"\nCommon columns: {have_all}\n")
+            fhout.write(f"Station ids: {df['station_id'].tolist()}\n")
+            if typ == 'hly':
+                fhout.write(f"Estimated dataset size: "
+                            f"{(df['max_date'].min() - df['min_date'].max()).days * 24} rows\n\n")
 
 
 TABLE_PREFIX = "weather"
@@ -659,6 +794,7 @@ def create_table_hbase(table_name: str, args: dict, connection: happybase.connec
     Create hbase table
     :param table_name: Name of table
     :param args: Arguments
+    :param connection: hbase connection
     :return:
     """
     if connection is None:
@@ -674,14 +810,16 @@ def bytes_to_str(array):
     return array if isinstance(array, str) else "".join(map(chr, array))
 
 
-
 def save_to_hbase(data: pd.DataFrame, station: int, row_template: dict, args: dict,
                   connection: happybase.connection = None, close: bool = False):
     """
     Save station data to hbase
+    :param row_template:
     :param data: Dataframe
     :param station: Station number
     :param args: Arguments
+    :param connection: hbase connection
+    :param close: close connection when done flag
     :return:
     """
     if connection is None:
@@ -690,6 +828,7 @@ def save_to_hbase(data: pd.DataFrame, station: int, row_template: dict, args: di
     print(f"Saving data from station {station} to hbase")
 
     count = 0
+    total = 0
     table = connection.table(DATA_TABLE)
     with table.batch(batch_size=1000) as b:
         for row in data.iterrows():
@@ -711,7 +850,7 @@ def save_to_hbase(data: pd.DataFrame, station: int, row_template: dict, args: di
                         for key, value in save_row.items()}
 
             b.put(row_name, save_row)
-            count += 1
+            count = progress("Row", total, count)
 
     print(f"Saved {count} rows")
 
@@ -719,68 +858,170 @@ def save_to_hbase(data: pd.DataFrame, station: int, row_template: dict, args: di
         connection.close()
 
 
+def progress(cmt, total, current, step=100):
+    current += 1
+    if current % step == 0 or total == current:
+        percent = "" if total == 0 else f"({current * 100 / total:.1f}%)"
+        print(f"{cmt}: {current} {percent}", flush=True, end='\r' if total > current or total == 0 else '\n')
+    return current
+
+
+def get_station_config(cfg):
+    args = {}
+    for key, arg in [('station_number', 'number'), ('station_county', 'county'),
+                     ('station_open_year', 'open_year'), ('station_close_year', 'close_year')]:
+        if key in cfg:
+            args[arg] = None if cfg[key] == 'none' else cfg[key]
+    for arg in ['open_year', 'close_year']:
+        if arg in args and args[arg] is not None:
+            bad_arg = True
+            if isinstance(args[arg], int):
+                args[arg] = FilterArg(args[arg], Comparator.EQ)
+                bad_arg = False
+            elif isinstance(args[arg], str):
+                # process comparative argument e.g. <=1244
+                match = re.match(r"([<>=]+)\s*(\d{4})", args[arg])
+                if match:
+                    for comp, comparator in [('<', Comparator.LT), ('<=', Comparator.LT_EQ), ('=', Comparator.EQ),
+                                             ('>=', Comparator.GT_EQ), ('>', Comparator.GT)]:
+                        if match.group(1) == comp:
+                            args[arg] = FilterArg(match.group(2), comparator)
+                            bad_arg = False
+                            break
+
+            if bad_arg:
+                warning(f"Malformed argument '{arg}', ignoring")
+
+    return args
+
+
+def get_readings_config(cfg):
+    args = {}
+    for key, arg in [('reading_stations', 'number')]:
+        if key in cfg:
+            args[arg] = None if cfg[key] == 'none' else cfg[key]
+
+    return args
+
+
+def warning(msg):
+    print(f"Warning: {msg}")
+
+
+def error(msg):
+    sys.exit(f"Error: {msg}")
+
+
+def ignore_arg_warning(args_namespace, arg_lst):
+    for arg in arg_lst:
+        if arg in args_namespace:
+            warning(f"Ignoring '{arg}' argument")
+
+
+def arg_error(arg_parser, msg):
+    arg_parser.print_usage()
+    sys.exit(msg)
+
+
 def main():
-    arg_ctrl = ArgCtrl(os.path.basename(sys.argv[0]), dflt_config=None)
-    arg_ctrl.add_option('n', 'nrows', 'Number of rows of file to read', has_value=True, type='int')
+    arg_ctrl = ArgCtrl(os.path.basename(sys.argv[0]))
+    arg_ctrl.add_option('n', 'nrows', 'Number of rows of file to read', has_value=True, typ=int)
     arg_ctrl.add_option('t', 'thrift', f'Address of Thrift host; default {happybase.DEFAULT_HOST}', has_value=True,
                         dfl_value=happybase.DEFAULT_HOST)
     arg_ctrl.add_option('p', 'port', f'Host port; default {happybase.DEFAULT_PORT}', has_value=True,
                         dfl_value=happybase.DEFAULT_PORT)
-    arg_ctrl.add_option('d', 'delay', f'Inter-request delay (sec); default {happybase.DEFAULT_PORT}', has_value=True,
-                        dfl_value=INTER_REQ_DELAY, type='int')
+    arg_ctrl.add_option('d', 'delay', f'Inter-request delay (sec); default {INTER_REQ_DELAY}', has_value=True,
+                        dfl_value=INTER_REQ_DELAY, typ=int)
     arg_ctrl.add_option('f', 'folder', f'Folder to save files to; default {DFLT_SAVE_FOLDER}', has_value=True,
                         dfl_value=DFLT_SAVE_FOLDER)
     arg_ctrl.add_option('i', 'info', f'Path to save station data info to; default {DFLT_INFO_PATH}', has_value=True,
                         dfl_value=DFLT_INFO_PATH)
-    arg_ctrl.add_option('b', 'begin', 'Minimum date for readings; dd-mm-yyyy', has_value=True, type="date=%d-%m-%Y")
-    arg_ctrl.add_option('e', 'end', 'Maximum date for readings; dd-mm-yyyy', has_value=True, type="date=%d-%m-%Y")
-    arg_ctrl.add_option('s', 'save', f'Save files')
-    arg_ctrl.add_option('a', 'analyse', f'Analyse files')
-    arg_ctrl.add_option('u', 'upload', f'Upload data to hbase')
+    arg_ctrl.add_option('u', 'uri', f'Uri for data; default {BASE_URL}', has_value=True, dfl_value=BASE_URL)
+    arg_ctrl.add_option('b', 'begin', 'Minimum date for readings; yyyy-mm-dd', has_value=True, typ="date=%Y-%m-%d")
+    arg_ctrl.add_option('e', 'end', 'Maximum date for readings; yyyy-mm-dd', has_value=True, typ="date=%Y-%m-%d")
+    arg_ctrl.add_option('s', 'save', f'Save files', dfl_value=False)
+    arg_ctrl.add_option('a', 'analyse', f'Analyse files', dfl_value=False)
+    arg_ctrl.add_option('l', 'load', f'Upload data to hbase', dfl_value=False)
+    arg_ctrl.add_option('v', 'verbose', f'Verbose mode', dfl_value=False)
 
-    app_cfg = arg_ctrl.get_app_config(sys.argv[1:])
+    app_cfg = arg_ctrl.get_app_config(sys.argv[1:], set_defaults=False)
 
-    uri = 'file://../data/'
-    # uri = BASE_URL
-    stations = get_stations(uri, number=[532, 5704])
-    # county='Cork', open_year=YearArg(1990, Comparator.LT_EQ),
-    # close_year=YearArg(NOT_CLOSED, Comparator.EQ))
+    if app_cfg['verbose']:
+        print(f"{app_cfg}")
 
-    if 'save' in app_cfg:
+    # load station details
+    if app_cfg['load']:  # load data to hbase
+        stations_args = get_readings_config(app_cfg)
+    else:
+        stations_args = get_station_config(app_cfg)
+    stations = get_stations(app_cfg['uri'], **stations_args)
+
+    if app_cfg['save']:  # save files to local
         save_data(BASE_URL, stations[STATION_NUM].tolist(), stations[STATION_NAME].tolist(), app_cfg)
 
-    if 'analyse' in app_cfg or 'upload' in app_cfg:
-        column_list, read_args = get_data_columns(uri, stations[STATION_NUM].tolist(), stations[STATION_NAME].tolist(),
-                                                  app_cfg)
+    if app_cfg['analyse'] or app_cfg['load']:  # analyse or load data to hbase
+        column_list, read_args = get_data_columns(app_cfg['uri'], stations[STATION_NUM].tolist(),
+                                                  stations[STATION_NAME].tolist(), app_cfg)
 
         station_filters = []
-        if 'upload' in app_cfg:
+        if app_cfg['load']:  # load data to hbase
 
-            row_template = {get_row_key(x): "" for x in column_list}
+            # only save columns required
+            save_col_list = []
+            for save_col in app_cfg['reading_columns']:
+                for col in column_list:
+                    if col.startswith(save_col):
+                        save_col_list.append(col)
+            drop_col_list = [value for value in column_list if value not in save_col_list]
+
+            row_template = {get_row_key(x): "" for x in save_col_list}
 
             if app_cfg['begin'] is not None:
-                station_filters.append(DfFilter(DATA_DATE, 'subset_by_val', FilterArg(app_cfg['begin'], Comparator.GT_EQ)))
+                station_filters.append(DfFilter(DATA_DATE, 'subset_by_val',
+                                                FilterArg(app_cfg['begin'], Comparator.GT_EQ)))
             if app_cfg['end'] is not None:
-                station_filters.append(DfFilter(DATA_DATE, 'subset_by_val', FilterArg(app_cfg['end'], Comparator.LT_EQ)))
+                station_filters.append(DfFilter(DATA_DATE, 'subset_by_val',
+                                                FilterArg(app_cfg['end'], Comparator.LT_EQ)))
 
             connection = create_table_hbase(DATA_TABLE, app_cfg)
+        else:
+            row_template = None
+            connection = None
+            drop_col_list = None
 
+        query_rm_file = True
         station_range = range(len(stations[STATION_NUM]))
         for index in station_range:
             station_num = stations[STATION_NUM].iloc[index]
             station_name = stations[STATION_NAME].iloc[index]
 
-            if 'upload' in app_cfg:
-                data = get_station_data(uri, station_num, station_name, read_args[station_num], app_cfg,
-                                        filters=station_filters)
-            else:
-                analyse_station_data(uri, station_num, station_name, read_args[station_num], app_cfg)
+            if station_num not in read_args:
+                print(f"Ignoring station {station_num}, data not available")
+                continue
+            print(f"Processing station {station_num} ({index + 1}/{station_range.stop})")
+
+            if app_cfg['load']:  # load data to hbase
+                station_drop_col = []
+                for col in drop_col_list:
+                    if col.endswith(str(station_name)):
+                        station_drop_col.append(col)
+
+                data = get_station_data(app_cfg['uri'], station_num, station_name, read_args[station_num], app_cfg,
+                                        filters=station_filters, drop=station_drop_col)
+            else:  # analyse data
+                analyse_station_data(app_cfg['uri'], station_num, station_name, read_args[station_num],
+                                     app_cfg, query_rm_file)
+                query_rm_file = False
+                data = None
 
             loop_end = index == station_range.stop - 1
-            inter_request_delay(not loop_end, app_cfg['delay'])
+            inter_request_delay(not loop_end, app_cfg['uri'], app_cfg['delay'])
 
-            if 'upload' in app_cfg:
+            if app_cfg['load']:  # load data to hbase
                 save_to_hbase(data, station_num, row_template, app_cfg, connection=connection, close=loop_end)
+
+    if app_cfg['analyse']:  # analyse data
+        station_analysis_summary(app_cfg)
 
 
 if __name__ == "__main__":

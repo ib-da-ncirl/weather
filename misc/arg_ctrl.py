@@ -29,7 +29,7 @@ from typing import Union
 import pkg_resources
 import yaml
 
-ConfigOpt = namedtuple('ConfigOpt', ['short', 'long', 'desc', 'has_value', 'req', 'dfl_value', 'type'])
+ConfigOpt = namedtuple('ConfigOpt', ['short', 'long', 'desc', 'has_value', 'req', 'dfl_value', 'typ'])
 
 
 class ArgCtrl:
@@ -43,7 +43,7 @@ class ArgCtrl:
         self._name = name
 
     def add_option(self, short_name: str, long_name: str, description: str, has_value: bool = False,
-                   required: bool = False, dfl_value=None, type='str'):
+                   required: bool = False, dfl_value=None, typ=str):
         """
         Add an option
         :param short_name: Short name
@@ -52,7 +52,7 @@ class ArgCtrl:
         :param has_value: Has value flag
         :param required: Is required flag
         :param dfl_value: Default value, if not present
-        :param type: type to convert command line value to
+        :param typ: type to convert command line value to
         :return:
         """
         if short_name in self._opts.keys():
@@ -61,7 +61,7 @@ class ArgCtrl:
 
         self._opts[short_name] = ConfigOpt(short_name if not has_value else f"{short_name}:",
                                            long_name if not has_value else f"{long_name}=",
-                                           description, has_value, required, dfl_value, type)
+                                           description, has_value, required, dfl_value, typ)
 
     @property
     def options(self):
@@ -133,11 +133,9 @@ class ArgCtrl:
         for o_key, opt_info in self._opts.items():
             if opt_info.has_value:
                 short_opt = opt_info.short[:-1] + ' <value>'
-            else:
-                short_opt = opt_info.short
-            if opt_info.long.has_value:
                 long_opt = opt_info.long[:-1] + ' <value>'
             else:
+                short_opt = opt_info.short
                 long_opt = opt_info.long
             short_len = max(short_len, len(short_opt))
             long_len = max(long_len, len(long_opt))
@@ -146,11 +144,12 @@ class ArgCtrl:
             print(f' -{line[0]:{short_len}.{short_len}s}|--{line[1]:{long_len}.{long_len}s} : {line[2]}')
         print()
 
-    def get_app_config(self, args: list):
+    def get_app_config(self, args: list, set_defaults=False):
         """
         Get the application config
         Note: command line options override config file options
         :param args: command line args
+        :param set_defaults: Set command line default values in config flag
         :return:
         """
         try:
@@ -165,13 +164,17 @@ class ArgCtrl:
         else:
             app_cfg_path = None
 
+        base_opts = ['h', 'c']
         cmd_line_args = {}
-        # set default arguments
-        for o_key, opt_info in {x: self._opts[x] for x in self._opts if x not in ['h', 'c']}.items():
-            if opt_info.has_value:
+        for o_key, opt_info in {x: self._opts[x] for x in self._opts if x not in base_opts}.items():
+            if opt_info.has_value and set_defaults:
+                # set default arguments
                 cmd_line_args[opt_info.long[:-1]] = opt_info.dfl_value
+            elif not opt_info.has_value:
+                # set flag
+                cmd_line_args[opt_info.long] = opt_info.dfl_value
         # read command line
-        exclude_opts = ['h', 'c']
+        exclude_opts = base_opts.copy()
         for opt, arg in opts:
             if opt == self.get_short_opt('h') or opt == self.get_long_opt('h'):
                 self.usage()
@@ -185,7 +188,18 @@ class ArgCtrl:
                     if opt == self.get_short_opt(o_key) or opt == self.get_long_opt(o_key):
                         exclude_opts.append(o_key)
                         raw_arg_key = opt_info.long[:-1] if opt_info.has_value else opt_info.long
-                        cmd_line_args[raw_arg_key] = arg
+                        if not arg == '':
+                            if opt_info.typ == int:
+                                arg = int(arg)
+                            elif opt_info.typ == float:
+                                arg = float(arg)
+                            elif isinstance(opt_info.typ, str) and opt_info.typ.startswith('date='):
+                                splits = opt_info.typ.split('=')
+                                if len(splits) == 2:
+                                    arg = datetime.datetime.strptime(arg, splits[1])
+                            cmd_line_args[raw_arg_key] = arg
+                        elif not opt_info.has_value:    # flag so indicate presence
+                            cmd_line_args[raw_arg_key] = True
                         break
 
         # load app config
@@ -195,22 +209,6 @@ class ArgCtrl:
             app_cfg = {}
 
         app_cfg.update(cmd_line_args)
-
-        exclude_opts = ['h', 'c']
-        for opt, arg in app_cfg.items():
-            for o_key, opt_info in {x: self._opts[x] for x in self._opts if x not in exclude_opts}.items():
-                if opt == self.get_long_opt_name(o_key):
-                    exclude_opts.append(o_key)
-                    if arg is not None:
-                        if opt_info.type == 'int':
-                            app_cfg[opt] = int(arg)
-                        elif opt_info.type == 'float':
-                            app_cfg[opt] = float(arg)
-                        elif opt_info.type.startswith('date='):
-                            splits = opt_info.type.split('=')
-                            if len(splits) == 2:
-                                app_cfg[opt] = datetime.datetime.strptime(arg, splits[1])
-                    break
 
         return app_cfg
 
